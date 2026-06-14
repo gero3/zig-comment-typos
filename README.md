@@ -6,7 +6,7 @@ It is not a full dictionary spellchecker. Instead, it scans `.zig` files, extrac
 
 ## Features
 
-- Recursively scans `.zig` files under a directory.
+- Scans a single `.zig` file or recursively scans `.zig` files under a directory.
 - Checks `//`, `///`, and `//!` comments.
 - Ignores comment-like text inside strings, character literals, and Zig multiline string lines.
 - Skips noisy code-like tokens such as URLs, email addresses, paths, identifiers, digits, underscores, and mixed-case words.
@@ -45,6 +45,12 @@ Scan a Zig project:
 
 ```sh
 zig-out/bin/zig-comment-typos path/to/project
+```
+
+Scan one Zig file:
+
+```sh
+zig-out/bin/zig-comment-typos path/to/file.zig
 ```
 
 Example output:
@@ -90,7 +96,6 @@ The module root re-exports the checker, fixer, rules, scanner, and word-tokeniza
 
 ## Current Limitations
 
-- Only directory input is supported.
 - Typo rules are currently built into the executable.
 - `--fix` only rewrites lowercase matches with explicit lowercase corrections.
 - Generated directories such as `.zig-cache` are not treated specially by the scanner yet; pass the source directory you want to check.

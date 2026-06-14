@@ -108,9 +108,63 @@ pub fn runProject(
     root_path: []const u8,
     fix: bool,
 ) !RunResult {
+    const stat = try std.Io.Dir.cwd().statFile(io, root_path, .{});
+    if (stat.kind == .file) {
+        return runFile(allocator, io, std.Io.Dir.cwd(), root_path, root_path, fix);
+    }
+
     var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer root.close(io);
     return runDirectory(allocator, io, root, fix);
+}
+
+fn runFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    file_path: []const u8,
+    display_file_path: []const u8,
+    fix: bool,
+) !RunResult {
+    var rule_set = try rules.defaultRules(allocator);
+    defer rule_set.deinit();
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    var result: RunResult = .{
+        .output = &.{},
+        .findings = 0,
+        .fixed = 0,
+        .unfixed = 0,
+    };
+
+    if (!std.mem.endsWith(u8, file_path, ".zig")) {
+        result.output = try output.toOwnedSlice();
+        return result;
+    }
+
+    const display_path = try normalizePath(allocator, display_file_path);
+    defer allocator.free(display_path);
+
+    const source = try root.readFileAlloc(io, file_path, allocator, .limited(max_file_bytes));
+    defer allocator.free(source);
+
+    const diagnostics = try checker.checkSource(allocator, display_path, source, &rule_set);
+    defer if (diagnostics.len != 0) allocator.free(diagnostics);
+
+    if (fix) {
+        try handleFixes(allocator, io, root, file_path, source, diagnostics, &output.writer, &result);
+    } else {
+        for (diagnostics) |diagnostic| {
+            try checker.formatDiagnostic(&output.writer, diagnostic);
+        }
+        result.findings += diagnostics.len;
+        result.unfixed += diagnostics.len;
+    }
+
+    result.output = try output.toOwnedSlice();
+    return result;
 }
 
 pub fn runDirectory(
@@ -261,6 +315,26 @@ test "CLI runner scans only sorted Zig files recursively" {
             "z.zig:1:4 typo \"speling\"\n",
         result.output,
     );
+}
+
+test "CLI runner scans a single Zig file input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sample.zig", .data = "// teh here\n" });
+
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sample.zig", .{&tmp.sub_path});
+    defer allocator.free(file_path);
+
+    var result = try runProject(allocator, std.testing.io, file_path, false);
+    defer result.deinit(allocator);
+
+    const expected = try std.fmt.allocPrint(allocator, "{s}:1:4 typo \"teh\", expected \"the\"\n", .{file_path});
+    defer allocator.free(expected);
+
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
+    try std.testing.expectEqualStrings(expected, result.output);
 }
 
 test "detects Windows absolute paths mangled by POSIX-style shells" {
