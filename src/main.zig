@@ -206,7 +206,7 @@ fn handleFixes(
 }
 
 fn collectZigFiles(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) ![][]u8 {
-    var walker = try root.walk(allocator);
+    var walker = try root.walkSelectively(allocator);
     defer walker.deinit();
 
     var files: std.ArrayList([]u8) = .empty;
@@ -216,6 +216,13 @@ fn collectZigFiles(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) !
     }
 
     while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            if (!isGeneratedDirectory(entry.basename)) {
+                try walker.enter(io, entry);
+            }
+            continue;
+        }
+
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
         const owned = try allocator.dupe(u8, entry.path);
@@ -225,6 +232,12 @@ fn collectZigFiles(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) !
 
     std.mem.sort([]u8, files.items, {}, lessPath);
     return files.toOwnedSlice(allocator);
+}
+
+fn isGeneratedDirectory(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".zig-cache") or
+        std.mem.eql(u8, name, "zig-cache") or
+        std.mem.eql(u8, name, "zig-out");
 }
 
 fn freeFileList(allocator: std.mem.Allocator, files: [][]u8) void {
@@ -259,6 +272,28 @@ test "CLI runner scans only sorted Zig files recursively" {
     try std.testing.expectEqualStrings(
         "nested/a.zig:1:4 typo \"teh\", expected \"the\"\n" ++
             "z.zig:1:4 typo \"speling\"\n",
+        result.output,
+    );
+}
+
+test "CLI runner skips generated Zig directories" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.createDirPath(std.testing.io, ".zig-cache/o");
+    try tmp.dir.createDirPath(std.testing.io, "zig-out/bin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/main.zig", .data = "// teh source\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/o/generated.zig", .data = "// speling generated\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "zig-out/bin/generated.zig", .data = "// recieve generated\n" });
+
+    var result = try runDirectory(allocator, std.testing.io, tmp.dir, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
+    try std.testing.expectEqualStrings(
+        "src/main.zig:1:4 typo \"teh\", expected \"the\"\n",
         result.output,
     );
 }
