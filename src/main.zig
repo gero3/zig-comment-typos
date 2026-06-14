@@ -127,11 +127,16 @@ pub fn runProjectWithRulesFile(
     fix: bool,
     rules_path: ?[]const u8,
 ) !RunResult {
-    var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
-    defer root.close(io);
-
     var rule_set = try loadRules(allocator, io, rules_path);
     defer rule_set.deinit();
+
+    const stat = try std.Io.Dir.cwd().statFile(io, root_path, .{});
+    if (stat.kind == .file) {
+        return runFileWithRuleSet(allocator, io, std.Io.Dir.cwd(), root_path, root_path, fix, &rule_set);
+    }
+
+    var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer root.close(io);
 
     return runDirectoryWithRuleSet(allocator, io, root, fix, &rule_set);
 }
@@ -143,6 +148,67 @@ fn loadRules(allocator: std.mem.Allocator, io: std.Io, rules_path: ?[]const u8) 
     defer allocator.free(source);
 
     return rules.parse(allocator, source);
+}
+
+fn runFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    file_path: []const u8,
+    display_file_path: []const u8,
+    fix: bool,
+) !RunResult {
+    var rule_set = try rules.defaultRules(allocator);
+    defer rule_set.deinit();
+
+    return runFileWithRuleSet(allocator, io, root, file_path, display_file_path, fix, &rule_set);
+}
+
+fn runFileWithRuleSet(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    file_path: []const u8,
+    display_file_path: []const u8,
+    fix: bool,
+    rule_set: *const rules.RuleSet,
+) !RunResult {
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    var result: RunResult = .{
+        .output = &.{},
+        .findings = 0,
+        .fixed = 0,
+        .unfixed = 0,
+    };
+
+    if (!std.mem.endsWith(u8, file_path, ".zig")) {
+        result.output = try output.toOwnedSlice();
+        return result;
+    }
+
+    const display_path = try normalizePath(allocator, display_file_path);
+    defer allocator.free(display_path);
+
+    const source = try root.readFileAlloc(io, file_path, allocator, .limited(max_file_bytes));
+    defer allocator.free(source);
+
+    const diagnostics = try checker.checkSource(allocator, display_path, source, rule_set);
+    defer if (diagnostics.len != 0) allocator.free(diagnostics);
+
+    if (fix) {
+        try handleFixes(allocator, io, root, file_path, source, diagnostics, &output.writer, &result);
+    } else {
+        for (diagnostics) |diagnostic| {
+            try checker.formatDiagnostic(&output.writer, diagnostic);
+        }
+        result.findings += diagnostics.len;
+        result.unfixed += diagnostics.len;
+    }
+
+    result.output = try output.toOwnedSlice();
+    return result;
 }
 
 pub fn runDirectory(
@@ -213,24 +279,30 @@ fn handleFixes(
     result: *RunResult,
 ) !void {
     var replacements: std.ArrayList(fixer.Replacement) = .empty;
-    defer replacements.deinit(allocator);
+    defer {
+        for (replacements.items) |replacement| allocator.free(replacement.correction);
+        replacements.deinit(allocator);
+    }
 
     for (diagnostics) |diagnostic| {
         result.findings += 1;
         if (diagnostic.correction) |correction| {
-            if (fixer.canFix(diagnostic.typo, correction)) {
-                try replacements.append(allocator, .{
+            if (try fixer.correctionFor(allocator, diagnostic.typo, correction)) |replacement_text| {
+                replacements.append(allocator, .{
                     .start = diagnostic.start,
                     .end = diagnostic.end,
-                    .correction = correction,
-                });
+                    .correction = replacement_text,
+                }) catch |err| {
+                    allocator.free(replacement_text);
+                    return err;
+                };
                 result.fixed += 1;
                 try writer.print("{s}:{d}:{d} fixed \"{s}\" -> \"{s}\"\n", .{
                     diagnostic.path,
                     diagnostic.line,
                     diagnostic.column,
                     diagnostic.typo,
-                    correction,
+                    replacement_text,
                 });
                 continue;
             }
@@ -305,6 +377,26 @@ test "CLI runner scans only sorted Zig files recursively" {
     );
 }
 
+test "CLI runner scans a single Zig file input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sample.zig", .data = "// teh here\n" });
+
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sample.zig", .{&tmp.sub_path});
+    defer allocator.free(file_path);
+
+    var result = try runProject(allocator, std.testing.io, file_path, false);
+    defer result.deinit(allocator);
+
+    const expected = try std.fmt.allocPrint(allocator, "{s}:1:4 typo \"teh\", expected \"the\"\n", .{file_path});
+    defer allocator.free(expected);
+
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
+    try std.testing.expectEqualStrings(expected, result.output);
+}
+
 test "detects Windows absolute paths mangled by POSIX-style shells" {
     try std.testing.expect(looksLikeDriveRelativeWindowsPath("C:ProjectsZiglangzig"));
     try std.testing.expect(!looksLikeDriveRelativeWindowsPath("C:/Projects/Ziglang/zig"));
@@ -342,6 +434,31 @@ test "CLI runner loads typo rules from a file" {
     try std.testing.expectEqualStrings("main.zig:1:4 typo \"wierd\", expected \"weird\"\n", result.output);
 }
 
+test "CLI runner applies external rules to a single Zig file input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sample.zig", .data = "// wierd typo\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rules.txt", .data = "wierd=weird\n" });
+
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer allocator.free(root_path);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/sample.zig", .{root_path});
+    defer allocator.free(file_path);
+    const rules_path = try std.fmt.allocPrint(allocator, "{s}/rules.txt", .{root_path});
+    defer allocator.free(rules_path);
+
+    var result = try runProjectWithRulesFile(allocator, std.testing.io, file_path, false, rules_path);
+    defer result.deinit(allocator);
+
+    const expected = try std.fmt.allocPrint(allocator, "{s}:1:4 typo \"wierd\", expected \"weird\"\n", .{file_path});
+    defer allocator.free(expected);
+
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
+    try std.testing.expectEqualStrings(expected, result.output);
+}
+
 test "CLI runner returns clean output when no typos are found" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -356,7 +473,7 @@ test "CLI runner returns clean output when no typos are found" {
     try std.testing.expectEqualStrings("", result.output);
 }
 
-test "fix mode rewrites only lowercase fixable typos inside comments" {
+test "fix mode rewrites fixable typos while preserving capitalization" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -369,16 +486,16 @@ test "fix mode rewrites only lowercase fixable typos inside comments" {
     var result = try runDirectory(allocator, std.testing.io, tmp.dir, true);
     defer result.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), result.fixed);
-    try std.testing.expectEqual(@as(usize, 2), result.unfixed);
+    try std.testing.expectEqual(@as(usize, 2), result.fixed);
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
     try std.testing.expectEqualStrings(
         "main.zig:1:4 fixed \"teh\" -> \"the\"\n" ++
             "main.zig:1:8 typo \"speling\"\n" ++
-            "main.zig:3:4 typo \"Teh\", expected \"the\"\n",
+            "main.zig:3:4 fixed \"Teh\" -> \"The\"\n",
         result.output,
     );
 
     const fixed = try tmp.dir.readFileAlloc(std.testing.io, "main.zig", allocator, .limited(max_file_bytes));
     defer if (fixed.len != 0) allocator.free(fixed);
-    try std.testing.expectEqualStrings("// the speling\nconst text = \"teh\";\n// Teh again\n", fixed);
+    try std.testing.expectEqualStrings("// the speling\nconst text = \"teh\";\n// The again\n", fixed);
 }
