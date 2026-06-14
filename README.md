@@ -6,13 +6,13 @@ It is not a full dictionary spellchecker. Instead, it scans `.zig` files, extrac
 
 ## Features
 
-- Recursively scans `.zig` files under a directory.
+- Scans a single `.zig` file or recursively scans `.zig` files under a directory.
 - Checks `//`, `///`, and `//!` comments.
 - Ignores comment-like text inside strings, character literals, and Zig multiline string lines.
 - Skips noisy code-like tokens such as URLs, email addresses, paths, identifiers, digits, underscores, and mixed-case words.
 - Skips generated Zig build directories such as `.zig-cache`, `zig-cache`, and `zig-out` during recursive scans.
 - Emits deterministic `path:line:column` diagnostics.
-- Supports `--fix` for typo rules with explicit lowercase corrections.
+- Supports `--fix` for typo rules with explicit lowercase corrections, preserving capitalization for title-case matches.
 
 ## Requirements
 
@@ -48,6 +48,12 @@ Scan a Zig project:
 zig-out/bin/zig-comment-typos path/to/project
 ```
 
+Scan one Zig file:
+
+```sh
+zig-out/bin/zig-comment-typos path/to/file.zig
+```
+
 Example output:
 
 ```text
@@ -55,7 +61,7 @@ src/main.zig:42:9 typo "teh", expected "the"
 src/main.zig:43:12 typo "speling"
 ```
 
-Use `--fix` to rewrite fixable lowercase typos in comments:
+Use `--fix` to rewrite fixable typos in comments:
 
 ```sh
 zig-out/bin/zig-comment-typos path/to/project --fix
@@ -65,7 +71,8 @@ Example fix output:
 
 ```text
 src/main.zig:42:9 fixed "teh" -> "the"
-src/main.zig:43:12 typo "speling"
+src/main.zig:43:9 fixed "Teh" -> "The"
+src/main.zig:44:12 typo "speling"
 ```
 
 ## Package Usage
@@ -91,9 +98,7 @@ The module root re-exports the checker, fixer, rules, scanner, and word-tokeniza
 
 ## Current Limitations
 
-- Only directory input is supported.
 - Typo rules are currently built into the executable.
-- `--fix` only rewrites lowercase matches with explicit lowercase corrections.
 
 ## License
 
