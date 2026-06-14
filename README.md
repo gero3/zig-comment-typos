@@ -10,6 +10,7 @@ It is not a full dictionary spellchecker. Instead, it scans `.zig` files, extrac
 - Checks `//`, `///`, and `//!` comments.
 - Ignores comment-like text inside strings, character literals, and Zig multiline string lines.
 - Skips noisy code-like tokens such as URLs, email addresses, paths, identifiers, digits, underscores, and mixed-case words.
+- Skips generated Zig build directories such as `.zig-cache`, `zig-cache`, and `zig-out` during recursive scans.
 - Emits deterministic `path:line:column` diagnostics.
 - Supports `--fix` for typo rules with explicit lowercase corrections, preserving capitalization for title-case matches.
 - Supports `--rules` for loading typo rules from a file.
@@ -109,10 +110,6 @@ The module root re-exports the checker, fixer, rules, scanner, and word-tokeniza
 - `0`: no unfixed typos were found
 - `1`: one or more typos remain
 - `2`: invalid arguments or a scan error
-
-## Current Limitations
-
-- Generated directories such as `.zig-cache` are not treated specially by the scanner yet; pass the source directory you want to check.
 
 ## License
 
