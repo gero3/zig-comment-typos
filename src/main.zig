@@ -4,6 +4,7 @@ const fixer = @import("fixer.zig");
 const rules = @import("rules.zig");
 
 const max_file_bytes = 64 * 1024 * 1024;
+const max_rules_file_bytes = 1024 * 1024;
 
 pub const RunResult = struct {
     output: []u8,
@@ -20,6 +21,7 @@ pub const RunResult = struct {
 const Options = struct {
     path: []const u8,
     fix: bool,
+    rules_path: ?[]const u8,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -38,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    var result = runProject(init.gpa, init.io, options.path, options.fix) catch |err| {
+    var result = runProjectWithRulesFile(init.gpa, init.io, options.path, options.fix, options.rules_path) catch |err| {
         try printRunError(stderr, options.path, err);
         try stderr.flush();
         std.process.exit(2);
@@ -54,12 +56,18 @@ pub fn main(init: std.process.Init) !void {
 fn parseArgs(args: []const [:0]const u8) !Options {
     var path: ?[]const u8 = null;
     var fix = false;
+    var rules_path: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--fix")) {
             fix = true;
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            if (rules_path != null) return error.InvalidArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            rules_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.InvalidArgs;
         } else if (path == null) {
@@ -72,11 +80,12 @@ fn parseArgs(args: []const [:0]const u8) !Options {
     return .{
         .path = path orelse return error.InvalidArgs,
         .fix = fix,
+        .rules_path = rules_path,
     };
 }
 
 fn printUsage(writer: *std.Io.Writer) !void {
-    try writer.writeAll("usage: zig-comment-typos path/to/project [--fix]\n");
+    try writer.writeAll("usage: zig-comment-typos path/to/project [--fix] [--rules path/to/rules.txt]\n");
 }
 
 fn printRunError(writer: *std.Io.Writer, path: []const u8, err: anyerror) !void {
@@ -108,9 +117,32 @@ pub fn runProject(
     root_path: []const u8,
     fix: bool,
 ) !RunResult {
+    return runProjectWithRulesFile(allocator, io, root_path, fix, null);
+}
+
+pub fn runProjectWithRulesFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    fix: bool,
+    rules_path: ?[]const u8,
+) !RunResult {
     var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer root.close(io);
-    return runDirectory(allocator, io, root, fix);
+
+    var rule_set = try loadRules(allocator, io, rules_path);
+    defer rule_set.deinit();
+
+    return runDirectoryWithRuleSet(allocator, io, root, fix, &rule_set);
+}
+
+fn loadRules(allocator: std.mem.Allocator, io: std.Io, rules_path: ?[]const u8) !rules.RuleSet {
+    const path = rules_path orelse return rules.defaultRules(allocator);
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_rules_file_bytes));
+    defer allocator.free(source);
+
+    return rules.parse(allocator, source);
 }
 
 pub fn runDirectory(
@@ -122,6 +154,16 @@ pub fn runDirectory(
     var rule_set = try rules.defaultRules(allocator);
     defer rule_set.deinit();
 
+    return runDirectoryWithRuleSet(allocator, io, root, fix, &rule_set);
+}
+
+fn runDirectoryWithRuleSet(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    fix: bool,
+    rule_set: *const rules.RuleSet,
+) !RunResult {
     const files = try collectZigFiles(allocator, io, root);
     defer freeFileList(allocator, files);
 
@@ -142,7 +184,7 @@ pub fn runDirectory(
         const source = try root.readFileAlloc(io, file_path, allocator, .limited(max_file_bytes));
         defer allocator.free(source);
 
-        const diagnostics = try checker.checkSource(allocator, display_path, source, &rule_set);
+        const diagnostics = try checker.checkSource(allocator, display_path, source, rule_set);
         defer if (diagnostics.len != 0) allocator.free(diagnostics);
 
         if (fix) {
@@ -268,6 +310,36 @@ test "detects Windows absolute paths mangled by POSIX-style shells" {
     try std.testing.expect(!looksLikeDriveRelativeWindowsPath("C:/Projects/Ziglang/zig"));
     try std.testing.expect(!looksLikeDriveRelativeWindowsPath("C:\\Projects\\Ziglang\\zig"));
     try std.testing.expect(!looksLikeDriveRelativeWindowsPath("relative/path"));
+}
+
+test "CLI parser accepts an external rules file" {
+    const args = [_][:0]const u8{ "zig-comment-typos", "--rules", "rules.txt", "src", "--fix" };
+
+    const options = try parseArgs(&args);
+
+    try std.testing.expectEqualStrings("src", options.path);
+    try std.testing.expect(options.fix);
+    try std.testing.expectEqualStrings("rules.txt", options.rules_path.?);
+}
+
+test "CLI runner loads typo rules from a file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "// wierd typo\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rules.txt", .data = "wierd=weird\n" });
+
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer allocator.free(root_path);
+    const rules_path = try std.fmt.allocPrint(allocator, "{s}/rules.txt", .{root_path});
+    defer allocator.free(rules_path);
+
+    var result = try runProjectWithRulesFile(allocator, std.testing.io, root_path, false, rules_path);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
+    try std.testing.expectEqualStrings("main.zig:1:4 typo \"wierd\", expected \"weird\"\n", result.output);
 }
 
 test "CLI runner returns clean output when no typos are found" {
