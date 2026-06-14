@@ -40,15 +40,7 @@ pub const RuleSet = struct {
     }
 };
 
-pub const default_rule_source =
-    \\teh=the
-    \\recieve=receive
-    \\seperate=separate
-    \\adress=address
-    \\occured=occurred
-    \\speling
-    \\jsut=just
-;
+pub const default_rule_source = @embedFile("default-rules.txt");
 
 pub fn defaultRules(allocator: std.mem.Allocator) !RuleSet {
     return parse(allocator, default_rule_source);

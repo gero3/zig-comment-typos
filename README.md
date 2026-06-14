@@ -98,6 +98,8 @@ Use `--rules` to load a rule file instead of the built-in defaults:
 zig-out/bin/zig-comment-typos path/to/project --rules typos.rules
 ```
 
+The packaged default rules live in `src/default-rules.txt`.
+
 Rule files use one rule per line. A bare typo reports a diagnostic without a fix, while `typo=correction` also enables `--fix` when the correction is fixable:
 
 ```text
