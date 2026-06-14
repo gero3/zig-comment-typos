@@ -2,6 +2,7 @@ const std = @import("std");
 const checker = @import("checker.zig");
 const fixer = @import("fixer.zig");
 const rules = @import("rules.zig");
+const scanner = @import("scanner.zig");
 
 const max_file_bytes = 64 * 1024 * 1024;
 const max_rules_file_bytes = 1024 * 1024;
@@ -21,6 +22,7 @@ pub const RunResult = struct {
 const Options = struct {
     path: []const u8,
     fix: bool,
+    extract_text: bool,
     rules_path: ?[]const u8,
 };
 
@@ -40,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    var result = runProjectWithRulesFile(init.gpa, init.io, options.path, options.fix, options.rules_path) catch |err| {
+    var result = runProjectForOptions(init.gpa, init.io, options) catch |err| {
         try printRunError(stderr, options.path, err);
         try stderr.flush();
         std.process.exit(2);
@@ -56,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
 fn parseArgs(args: []const [:0]const u8) !Options {
     var path: ?[]const u8 = null;
     var fix = false;
+    var extract_text = false;
     var rules_path: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -63,6 +66,8 @@ fn parseArgs(args: []const [:0]const u8) !Options {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--fix")) {
             fix = true;
+        } else if (std.mem.eql(u8, arg, "--extract-text")) {
+            extract_text = true;
         } else if (std.mem.eql(u8, arg, "--rules")) {
             if (rules_path != null) return error.InvalidArgs;
             i += 1;
@@ -77,15 +82,18 @@ fn parseArgs(args: []const [:0]const u8) !Options {
         }
     }
 
+    if (fix and extract_text) return error.InvalidArgs;
+
     return .{
         .path = path orelse return error.InvalidArgs,
         .fix = fix,
+        .extract_text = extract_text,
         .rules_path = rules_path,
     };
 }
 
 fn printUsage(writer: *std.Io.Writer) !void {
-    try writer.writeAll("usage: zig-comment-typos path/to/project [--fix] [--rules path/to/rules.txt]\n");
+    try writer.writeAll("usage: zig-comment-typos path/to/project [--fix | --extract-text] [--rules path/to/rules.txt]\n");
 }
 
 fn printRunError(writer: *std.Io.Writer, path: []const u8, err: anyerror) !void {
@@ -109,6 +117,18 @@ fn looksLikeDriveRelativeWindowsPath(path: []const u8) bool {
         path[1] == ':' and
         path[2] != '/' and
         path[2] != '\\';
+}
+
+fn runProjectForOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+) !RunResult {
+    if (options.extract_text) {
+        return extractProjectText(allocator, io, options.path);
+    }
+
+    return runProjectWithRulesFile(allocator, io, options.path, options.fix, options.rules_path);
 }
 
 pub fn runProject(
@@ -141,6 +161,22 @@ pub fn runProjectWithRulesFile(
     return runDirectoryWithRuleSet(allocator, io, root, fix, &rule_set);
 }
 
+pub fn extractProjectText(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+) !RunResult {
+    const stat = try std.Io.Dir.cwd().statFile(io, root_path, .{});
+    if (stat.kind == .file) {
+        return extractFileText(allocator, io, std.Io.Dir.cwd(), root_path, root_path);
+    }
+
+    var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer root.close(io);
+
+    return extractDirectoryText(allocator, io, root);
+}
+
 fn loadRules(allocator: std.mem.Allocator, io: std.Io, rules_path: ?[]const u8) !rules.RuleSet {
     const path = rules_path orelse return rules.defaultRules(allocator);
 
@@ -162,6 +198,29 @@ fn runFile(
     defer rule_set.deinit();
 
     return runFileWithRuleSet(allocator, io, root, file_path, display_file_path, fix, &rule_set);
+}
+
+fn extractFileText(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    file_path: []const u8,
+    display_file_path: []const u8,
+) !RunResult {
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    var result: RunResult = .{
+        .output = &.{},
+        .findings = 0,
+        .fixed = 0,
+        .unfixed = 0,
+    };
+
+    try extractFileTextInto(allocator, io, root, file_path, display_file_path, &output.writer);
+
+    result.output = try output.toOwnedSlice();
+    return result;
 }
 
 fn runFileWithRuleSet(
@@ -223,6 +282,32 @@ pub fn runDirectory(
     return runDirectoryWithRuleSet(allocator, io, root, fix, &rule_set);
 }
 
+pub fn extractDirectoryText(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+) !RunResult {
+    const files = try collectZigFiles(allocator, io, root);
+    defer freeFileList(allocator, files);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    var result: RunResult = .{
+        .output = &.{},
+        .findings = 0,
+        .fixed = 0,
+        .unfixed = 0,
+    };
+
+    for (files) |file_path| {
+        try extractFileTextInto(allocator, io, root, file_path, file_path, &output.writer);
+    }
+
+    result.output = try output.toOwnedSlice();
+    return result;
+}
+
 fn runDirectoryWithRuleSet(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -266,6 +351,39 @@ fn runDirectoryWithRuleSet(
 
     result.output = try output.toOwnedSlice();
     return result;
+}
+
+fn extractFileTextInto(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    file_path: []const u8,
+    display_file_path: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    if (!std.mem.endsWith(u8, file_path, ".zig")) return;
+
+    const display_path = try normalizePath(allocator, display_file_path);
+    defer allocator.free(display_path);
+
+    const source = try root.readFileAlloc(io, file_path, allocator, .limited(max_file_bytes));
+    defer allocator.free(source);
+
+    const spans = try scanner.scan(allocator, display_path, source);
+    defer if (spans.len != 0) allocator.free(spans);
+
+    for (spans) |span| {
+        try formatExtractedText(writer, span);
+    }
+}
+
+fn formatExtractedText(writer: *std.Io.Writer, span: scanner.CommentSpan) !void {
+    try writer.print("{s}:{d}:{d}:{s}\n", .{
+        span.path,
+        span.line,
+        span.column,
+        span.text,
+    });
 }
 
 fn handleFixes(
@@ -447,6 +565,69 @@ test "CLI parser accepts an external rules file" {
     try std.testing.expectEqualStrings("src", options.path);
     try std.testing.expect(options.fix);
     try std.testing.expectEqualStrings("rules.txt", options.rules_path.?);
+}
+
+test "CLI parser accepts extract-text mode" {
+    const args = [_][:0]const u8{ "zig-comment-typos", "--extract-text", "--rules", "rules.txt", "src" };
+
+    const options = try parseArgs(&args);
+
+    try std.testing.expectEqualStrings("src", options.path);
+    try std.testing.expect(!options.fix);
+    try std.testing.expect(options.extract_text);
+    try std.testing.expectEqualStrings("rules.txt", options.rules_path.?);
+}
+
+test "CLI parser rejects fix with extract-text mode" {
+    const args = [_][:0]const u8{ "zig-comment-typos", "src", "--fix", "--extract-text" };
+
+    try std.testing.expectError(error.InvalidArgs, parseArgs(&args));
+}
+
+test "extract-text mode emits sorted scanner text without diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "z.zig", .data = "const text = \"teh\";\n// teh source\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/a.zig", .data = "//!container docs\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ignore.txt", .data = "// speling ignored\n" });
+
+    var result = try extractDirectoryText(allocator, std.testing.io, tmp.dir);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.findings);
+    try std.testing.expectEqual(@as(usize, 0), result.fixed);
+    try std.testing.expectEqual(@as(usize, 0), result.unfixed);
+    try std.testing.expectEqualStrings(
+        "nested/a.zig:1:4:container docs\n" ++
+            "z.zig:2:3: teh source\n",
+        result.output,
+    );
+}
+
+test "extract-text mode does not load rules files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "// teh source\n" });
+
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer allocator.free(root_path);
+    const missing_rules_path = try std.fmt.allocPrint(allocator, "{s}/missing.rules", .{root_path});
+    defer allocator.free(missing_rules_path);
+
+    var result = try runProjectForOptions(allocator, std.testing.io, .{
+        .path = root_path,
+        .fix = false,
+        .extract_text = true,
+        .rules_path = missing_rules_path,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("main.zig:1:3: teh source\n", result.output);
 }
 
 test "CLI runner loads typo rules from a file" {

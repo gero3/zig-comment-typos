@@ -13,6 +13,7 @@ It is not a full dictionary spellchecker. Instead, it scans `.zig` files, extrac
 - Skips generated Zig build directories such as `.zig-cache`, `zig-cache`, and `zig-out` during recursive scans.
 - Emits deterministic `path:line:column` diagnostics.
 - Supports `--fix` for typo rules with explicit lowercase corrections, preserving capitalization for title-case matches.
+- Supports `--extract-text` for printing the comment text that would be checked, without running typo rules.
 - Supports `--rules` for loading typo rules from a file.
 
 ## Requirements
@@ -61,6 +62,21 @@ Example output:
 src/main.zig:42:9 typo "teh", expected "the"
 src/main.zig:43:12 typo "speling"
 ```
+
+Use `--extract-text` to print every extracted comment span without checking it:
+
+```sh
+zig-out/bin/zig-comment-typos path/to/project --extract-text
+```
+
+Example extract output:
+
+```text
+src/main.zig:42:3: regular comment text
+src/main.zig:43:4:doc comment text
+```
+
+The format is `path:line:column:text`. The text after the final colon is the exact comment text passed to the checker, and typo rules are not loaded or run in this mode. `--extract-text` cannot be combined with `--fix`.
 
 Use `--fix` to rewrite fixable typos in comments:
 
