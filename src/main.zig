@@ -171,24 +171,30 @@ fn handleFixes(
     result: *RunResult,
 ) !void {
     var replacements: std.ArrayList(fixer.Replacement) = .empty;
-    defer replacements.deinit(allocator);
+    defer {
+        for (replacements.items) |replacement| allocator.free(replacement.correction);
+        replacements.deinit(allocator);
+    }
 
     for (diagnostics) |diagnostic| {
         result.findings += 1;
         if (diagnostic.correction) |correction| {
-            if (fixer.canFix(diagnostic.typo, correction)) {
-                try replacements.append(allocator, .{
+            if (try fixer.correctionFor(allocator, diagnostic.typo, correction)) |replacement_text| {
+                replacements.append(allocator, .{
                     .start = diagnostic.start,
                     .end = diagnostic.end,
-                    .correction = correction,
-                });
+                    .correction = replacement_text,
+                }) catch |err| {
+                    allocator.free(replacement_text);
+                    return err;
+                };
                 result.fixed += 1;
                 try writer.print("{s}:{d}:{d} fixed \"{s}\" -> \"{s}\"\n", .{
                     diagnostic.path,
                     diagnostic.line,
                     diagnostic.column,
                     diagnostic.typo,
-                    correction,
+                    replacement_text,
                 });
                 continue;
             }
@@ -284,7 +290,7 @@ test "CLI runner returns clean output when no typos are found" {
     try std.testing.expectEqualStrings("", result.output);
 }
 
-test "fix mode rewrites only lowercase fixable typos inside comments" {
+test "fix mode rewrites fixable typos while preserving capitalization" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -297,16 +303,16 @@ test "fix mode rewrites only lowercase fixable typos inside comments" {
     var result = try runDirectory(allocator, std.testing.io, tmp.dir, true);
     defer result.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), result.fixed);
-    try std.testing.expectEqual(@as(usize, 2), result.unfixed);
+    try std.testing.expectEqual(@as(usize, 2), result.fixed);
+    try std.testing.expectEqual(@as(usize, 1), result.unfixed);
     try std.testing.expectEqualStrings(
         "main.zig:1:4 fixed \"teh\" -> \"the\"\n" ++
             "main.zig:1:8 typo \"speling\"\n" ++
-            "main.zig:3:4 typo \"Teh\", expected \"the\"\n",
+            "main.zig:3:4 fixed \"Teh\" -> \"The\"\n",
         result.output,
     );
 
     const fixed = try tmp.dir.readFileAlloc(std.testing.io, "main.zig", allocator, .limited(max_file_bytes));
     defer if (fixed.len != 0) allocator.free(fixed);
-    try std.testing.expectEqualStrings("// the speling\nconst text = \"teh\";\n// Teh again\n", fixed);
+    try std.testing.expectEqualStrings("// the speling\nconst text = \"teh\";\n// The again\n", fixed);
 }
