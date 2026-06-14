@@ -12,6 +12,7 @@ It is not a full dictionary spellchecker. Instead, it scans `.zig` files, extrac
 - Skips noisy code-like tokens such as URLs, email addresses, paths, identifiers, digits, underscores, and mixed-case words.
 - Emits deterministic `path:line:column` diagnostics.
 - Supports `--fix` for typo rules with explicit lowercase corrections, preserving capitalization for title-case matches.
+- Supports `--rules` for loading typo rules from a file.
 
 ## Requirements
 
@@ -74,6 +75,20 @@ src/main.zig:43:9 fixed "Teh" -> "The"
 src/main.zig:44:12 typo "speling"
 ```
 
+Use `--rules` to load a rule file instead of the built-in defaults:
+
+```sh
+zig-out/bin/zig-comment-typos path/to/project --rules typos.rules
+```
+
+Rule files use one rule per line. A bare typo reports a diagnostic without a fix, while `typo=correction` also enables `--fix` when the correction is fixable:
+
+```text
+speling
+teh=the
+recieve=receive
+```
+
 ## Package Usage
 
 This repository also exposes a Zig module named `comment_typos`.
@@ -97,7 +112,6 @@ The module root re-exports the checker, fixer, rules, scanner, and word-tokeniza
 
 ## Current Limitations
 
-- Typo rules are currently built into the executable.
 - Generated directories such as `.zig-cache` are not treated specially by the scanner yet; pass the source directory you want to check.
 
 ## License
